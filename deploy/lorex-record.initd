@@ -1,0 +1,52 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          lorex-record
+# Required-Start:    $network $remote_fs
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Lorex RTSP recorder -> WD local storage
+### END INIT INFO
+# 开机钩子：WDMyCloud 重启后自动拉起 Lorex 录像（视频复制、不转码）
+PATH=/usr/local/bin:/usr/bin:/bin
+REC=/root/lorex_record.sh
+LOG=/shares/Public/Lorex_Records/record.log
+LOCKDIR=/tmp/lorex_record.lockdir
+
+is_alive() {
+  # 仅当锁目录存在且其中 pid 确实存活(且为本脚本)才视为运行中
+  [ -d "$LOCKDIR" ] || return 1
+  OP=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  [ -n "$OP" ] && kill -0 "$OP" 2>/dev/null && grep -q "lorex_record.sh" /proc/$OP/cmdline 2>/dev/null
+}
+
+case "$1" in
+  start)
+    if is_alive; then
+      echo "lorex-record already running (pid $(cat $LOCKDIR/pid))"
+    else
+      # 陈旧锁（如被 -9 强杀）清理后重启
+      rm -rf "$LOCKDIR" 2>/dev/null
+      setsid "$REC" >> "$LOG" 2>&1 < /dev/null &
+      echo "lorex-record started"
+    fi
+    ;;
+  stop)
+    if [ -d "$LOCKDIR" ]; then
+      OP=$(cat "$LOCKDIR/pid" 2>/dev/null)
+      [ -n "$OP" ] && kill -9 "$OP" 2>/dev/null
+    fi
+    for p in $(pgrep -f "lorex_record.sh"); do kill -9 "$p" 2>/dev/null; done
+    for p in $(pgrep ffmpeg); do kill -9 "$p" 2>/dev/null; done
+    rm -rf "$LOCKDIR" 2>/dev/null
+    echo "lorex-record stopped"
+    ;;
+  restart)
+    $0 stop; sleep 2; $0 start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+exit 0

@@ -1,5 +1,6 @@
-# 本地敏感凭证（含 WD 密码，勿入库）
+# 本地敏感凭证（含 WD / Lorex 密码，勿入库）
 deploy/detect/secrets.env
+deploy/secrets.env
 
 # macOS
 .DS_Store
