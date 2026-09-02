@@ -1,0 +1,15 @@
+# 本地敏感凭证（含 WD 密码，勿入库）
+deploy/detect/secrets.env
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+
+# 暂不纳入版本控制的目录
+.workbuddy/
+audit/
+samples/
+tools/
+train_raccoon/

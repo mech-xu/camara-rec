@@ -1,0 +1,18 @@
+[Unit]
+Description=Lorex Camera Smart Detection (UGREEN)
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sunny/camara-detect
+Environment=TZ=America/Toronto
+ExecStart=/usr/bin/python3 /home/sunny/camara-detect/lorex_detect.py --daemon
+Restart=always
+RestartSec=30
+TimeoutStopSec=15
+StandardOutput=append:/home/sunny/camara-detect/daemon.log
+StandardError=append:/home/sunny/camara-detect/daemon.log
+
+[Install]
+WantedBy=default.target
