@@ -14,3 +14,6 @@ audit/
 samples/
 tools/
 train_raccoon/
+
+# 本地备份
+*.bak

@@ -77,13 +77,36 @@ MOTION_NIGHT_HOURS = set(range(20, 24)) | set(range(0, 6))  # 20:00-05:59
 MOTION_BLUR_KSIZE = 5                 # 高斯模糊降噪（IR 夜视噪点）
 MOTION_THRESH = 20                    # 帧差像素阈值(0-255)
 MOTION_COLOR = (60, 200, 255)         # 兜底框颜色（橙黄，与 person/cat/dog 区分）
+# 自适应背景 + 时间去抖参数（修复静止目标/壁灯干扰误报）
+MOTION_BG_ALPHA = 0.02                # 背景 EMA 学习率（越小越慢，静止物体越快并入背景）
+MOTION_DEBOUNCE_WINDOW = 4            # 去抖滑动窗口（帧）
+MOTION_DEBOUNCE_HITS = 2              # 窗口内至少命中几次才算真运动（过滤单帧灯光闪烁）
+MOTION_EXCLUDE_ZONES = []             # 运动兜底屏蔽区（2560x1440 坐标）；壁灯/篷布等固定目标按需填入
+MOTION_GLOBAL_FRAC = 0.6              # ROI 内变化像素占比超此值视为全局亮度变化（壁灯/IR 漂移），非运动
 
 
 class MotionDetector:
-    """相邻帧差 + ROI + 形态学 + 最大轮廓 bbox。轻量、零状态（除上一帧）。
-    每 chunk 由调用方 new 一个实例，避免日/夜光照切换导致 prev_gray 失效。"""
-    def __init__(self):
-        self.prev_gray = None
+    """自适应背景建模 + 时间去抖的帧差兜底。
+    相比朴素 absdiff(prev,cur)：
+      - 维护缓慢更新的背景 EMA，静止物体（车道蓝色篷布拖车、信箱等）很快并入背景，
+        不再产生帧差；夜间大门壁灯造成的缓慢亮度漂移也被背景吸收。
+      - 仅在「背景之外出现持续运动」时判定 motion，配合时间去抖（debounce），
+        单帧灯光闪烁 / IR illumination 抖动不会触发快照。
+    背景更新策略：当本帧运动面积低于阈值时才更新背景，避免把运动物体吸进背景。
+    每 chunk 由调用方 new 一个实例，避免日/夜切换污染背景。"""
+    def __init__(self, alpha=MOTION_BG_ALPHA, debounce_hits=MOTION_DEBOUNCE_HITS,
+                 debounce_window=MOTION_DEBOUNCE_WINDOW):
+        self.bg = None                       # float32 背景（灰度，1280 宽空间）
+        self.alpha = alpha
+        self.debounce_hits = debounce_hits
+        self.debounce_window = debounce_window
+        self._hits = []                      # 滑动窗口：最近若干帧是否触发
+
+    def _record(self, triggered):
+        self._hits.append(triggered)
+        if len(self._hits) > self.debounce_window:
+            self._hits.pop(0)
+        return triggered
 
     def update(self, frame):
         """返回 (motion_detected, bbox, area)。bbox 在 1280 宽缩放空间。"""
@@ -92,27 +115,37 @@ class MotionDetector:
         small = cv2.resize(frame, (1280, int(h * s)))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (MOTION_BLUR_KSIZE, MOTION_BLUR_KSIZE), 0)
-        if self.prev_gray is None:
-            self.prev_gray = gray
+        if self.bg is None:
+            self.bg = gray.astype(np.float32)
             return False, None, 0
-        diff = cv2.absdiff(self.prev_gray, gray)
+        # 用 float 背景直接求差（保留 EMA 的小数部分，避免 uint8 截断破坏缓慢亮度跟踪）
+        diff = np.abs(self.bg - gray.astype(np.float32)).astype(np.uint8)
         _, thresh = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)
         thresh = cv2.dilate(thresh, None, iterations=2)
         rx1, ry1, rx2, ry2 = MOTION_ROI
         ry2 = min(ry2, small.shape[0])
         roi = thresh[ry1:ry2, rx1:rx2]
         area = int((roi > 0).sum())
-        self.prev_gray = gray
-        if area < MOTION_MIN_AREA:
-            return False, None, area
+        roi_total = max(1, (rx2 - rx1) * (ry2 - ry1))
+        # 全局亮度变化（壁灯开关 / IR illumination 漂移 / 车灯扫过）会让整个 ROI
+        # 同步变化，占比极高，并非局部运动；此时直接吸收进背景、不触发兜底。
+        is_global = (area / roi_total) > MOTION_GLOBAL_FRAC
+        if area < MOTION_MIN_AREA or is_global:
+            self.bg = (1.0 - self.alpha) * self.bg + self.alpha * gray.astype(np.float32)
+            return self._record(False), None, area
         contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return False, None, area
+            return self._record(False), None, area
         largest = max(contours, key=cv2.contourArea)
         bx, by, bw, bh = cv2.boundingRect(largest)
         if bw < MOTION_MIN_BBOX or bh < MOTION_MIN_BBOX:
+            return self._record(False), None, area
+        # 时间去抖：本帧有运动，需滑动窗口内累计命中达标才判定为真运动
+        if sum(self._hits) + 1 < self.debounce_hits:
+            self._record(True)
             return False, None, area
+        self._record(True)
         return True, (rx1 + bx, ry1 + by, rx1 + bx + bw, ry1 + by + bh), area
 
 
@@ -498,6 +531,12 @@ def process_file(det, local_path, remote_name, start_offset, st_time,
             # 运动兜底：夜间 ROI 内有运动且无 WANTED 命中 → unknown_animal
             if is_night:
                 mot, mbox, marea = motion.update(frame)
+                if mot:
+                    mx1, my1, mx2, my2 = mbox
+                    # 运动兜底额外屏蔽区（原始 2560x1440 坐标）：壁灯/篷布等固定光源或物体
+                    if in_excluded_zone((mx1 * 2, my1 * 2, mx2 * 2, my2 * 2),
+                                        MOTION_EXCLUDE_ZONES):
+                        mot = False
                 if mot and not dets and (t_sec - last_motion_save) >= MOTION_COOLDOWN_SEC:
                     last_motion_save = t_sec
                     motion_hits += 1
