@@ -59,20 +59,25 @@ MAX_CHUNK_SEC = 1200    # 单次最多追多少秒
 # 静态热区抑制：固定摄像头下，某些固定物体（石柱、灌木丛、信箱杆等）会被
 # YOLOv8n 反复误标为 person。坐标是「原始帧坐标」(2560x1440)；只对 person 生效，
 # 避免误伤 cat/dog 走过同一区域。热区是窄矩形，真人 bbox 远大于此、中心一般落不进。
+# 2026-09-03 修正：原 y1=340 差 9px 罩不住石柱。COCO 实际给出的 person 框为
+# (1386,240,1456,422)，中心 (1421,331) —— x 落在区间内但 y=331 < 340，中心判定漏出，
+# 导致石柱被持续误报 person（0.25-0.62），污染统计并可能阻塞运动兜底。y1 上移至 220
+# 以完整覆盖框顶（240）并留出余量。
 EXCLUDE_ZONES = [
-    (1270, 340, 1450, 770),   # 石柱：车道边石墩，从木槿花丛里露出来的一截
+    (1270, 220, 1450, 770),   # 石柱：车道边石墩，从木槿花丛里露出来的一截
 ]
 
 # ============================== 运动兜底 ==============================
 # 用途：YOLOv8n (COCO 80 类) 没有 raccoon / opossum / skunk / fox / owl 等本地
 # 野生动物。夜间用车前/垃圾桶区 ROI 内的帧差检测运动，配合 person/cat/dog 互斥
-# （无 COCO 命中才触发），存 "unknown_animal" 快照。覆盖 COCO 漏掉的所有动物。
+# （无 COCO 命中才触发），存 "animal" 快照（2026-09-03 起由 unknown_animal 简化而来）。
+# 覆盖 COCO 漏掉的所有动物；浣熊模型暂disabled，未知动物统一走此兜底。
 # 限制：只夜间（动物活动高峰）启用 + 60s 冷却 + 每 chunk 重置 prev_gray，
 #       避免白天车辆/行人/树影误报和日→夜光照切换的误触发。
 MOTION_ROI = (0, 380, 1280, 720)     # x1,y1,x2,y2，1280 宽缩放坐标
 MOTION_MIN_AREA = 500                 # ROI 内运动像素 > 此值才触发
 MOTION_MIN_BBOX = 30                  # 最大轮廓 bbox 至少 30x30，过滤单点噪点
-MOTION_COOLDOWN_SEC = 60              # unknown_animal 保存冷却
+MOTION_COOLDOWN_SEC = 60              # animal 运动兜底保存冷却
 MOTION_NIGHT_HOURS = set(range(20, 24)) | set(range(0, 6))  # 20:00-05:59
 MOTION_BLUR_KSIZE = 5                 # 高斯模糊降噪（IR 夜视噪点）
 MOTION_THRESH = 20                    # 帧差像素阈值(0-255)
@@ -81,18 +86,24 @@ MOTION_COLOR = (60, 200, 255)         # 兜底框颜色（橙黄，与 person/ca
 MOTION_BG_ALPHA = 0.02                # 背景 EMA 学习率（越小越慢，静止物体越快并入背景）
 MOTION_DEBOUNCE_WINDOW = 4            # 去抖滑动窗口（帧）
 MOTION_DEBOUNCE_HITS = 2              # 窗口内至少命中几次才算真运动（过滤单帧灯光闪烁）
-# 运动兜底屏蔽区（仅对 motion 兜底 unknown_animal 生效；COCO/浣熊对真实动物不受影响）
-# 反推自 WD 夜间全画面 (2026-09-02 02:05:40 第10s)：
-#   L1 近壁灯: 灯泡 box (284,11,344,34)，含顶部光晕扩展
-#   L2 远壁灯: 沿 x 亮度投影峰 x~582, y~0-30，含顶部光晕扩展
-#   蓝篷布: HSV 蓝识别 (1233,561,1944,850)
-# 稳态的整面亮墙由自适应背景 EMA 吸收，无需整墙 zone
+# 运动兜底屏蔽区（仅对 motion 兜底 animal 生效；COCO 对真实动物不受影响）
+# 反推自 WD 夜间全画面 Garage_20260902_020540.mp4（@10s, 2026-09-02 02:05:50）：
+#   L1 近壁灯: 灯泡 box ~x[180,420] y[0,230]，覆盖灯泡+顶部光晕
+#   L2 远壁灯: 灯泡 box ~x[420,680] y[0,230]，覆盖灯泡+顶部光晕
+#   蓝篷布:   HSV 蓝识别 x[1229,1959] y[441,856]；区间下沿取 890 防飘移，顶边 430
+#             留 10px 余量盖住篷布上沿 drape。稳态的整面亮墙由自适应背景 EMA 吸收，
+#             右侧若干静态亮斑（IR/反射）同理，无需整墙 zone。
 MOTION_EXCLUDE_ZONES = [
     (180, 0, 420, 230),      # L1 近壁灯（左墙）灯泡+顶部光晕
     (420, 0, 680, 230),      # L2 远壁灯（左墙远端）灯泡+顶部光晕
-    (1210, 540, 1970, 880),  # 蓝色篷布（车道上静态目标，双保险）
+    (1210, 430, 1970, 890),  # 蓝色篷布（车道上静态目标，双保险）
 ]
 MOTION_GLOBAL_FRAC = 0.6              # ROI 内变化像素占比超此值视为全局亮度变化（壁灯/IR 漂移），非运动
+# 运动兜底与 COCO 的互斥判定。原逻辑是 `not dets`（COCO 有任何命中就不兜底），语义本意是
+# "模型已经认出来了就别重复兜底"，但静态误报（如石柱被判 person）同样会命中，于是把真实
+# 动物的运动兜底一起堵死。改为几何判定：只有某个检测框确实落在运动区域内（被覆盖率达标）
+# 才认为该运动已被模型覆盖。检测框与运动框不相干时（位置分离）照常兜底。
+MOTION_COVER_FRAC = 0.30              # 检测框被运动区域覆盖的面积占比 >= 此值，视为已覆盖
 
 
 class MotionDetector:
@@ -159,7 +170,8 @@ class MotionDetector:
         return True, (rx1 + bx, ry1 + by, rx1 + bx + bw, ry1 + by + bh), area
 
 
-# 最终输出类目：person / cat / dog + 浣熊（fine-tune 模型，COCO 无此类）
+# 最终输出类目：person / cat / dog + 浣熊（fine-tune 模型，COCO 无此类）。
+# 注：raccoon 于 2026-09-03 暂时禁用（见 main()），未知动物统一走 motion 兜底 "animal"。
 WANTED = {
     0: "person", 16: "cat", 17: "dog", RACCOON_CLASS_ID: "raccoon",
 }
@@ -262,6 +274,30 @@ def in_excluded_zone(box, zones=None):
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     for zx1, zy1, zx2, zy2 in zs:
         if zx1 <= cx <= zx2 and zy1 <= cy <= zy2:
+            return True
+    return False
+
+
+def motion_covered_by_dets(mbox, dets, cover_frac=MOTION_COVER_FRAC):
+    """运动 bbox 是否已被某个检测框覆盖（几何判定，替代原来的 `not dets`）。
+
+    mbox 来自 MotionDetector，位于 1280 宽缩放空间；dets 的框位于原始帧空间
+    （2560x1440），故先把 mbox 放大 2 倍对齐。判定用「检测框被运动区域覆盖的面积
+    占比」而非 IoU：动物的检测框通常整体落在运动框内部，IoU 会被大运动框稀释，
+    而覆盖率能稳定接近 1。
+    """
+    if mbox is None or not dets:
+        return False
+    mx1, my1, mx2, my2 = [int(v) * 2 for v in mbox]
+    mw, mh = max(1, mx2 - mx1), max(1, my2 - my1)
+    for cid, conf, (bx1, by1, bx2, by2) in dets:
+        bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
+        ix1, iy1 = max(mx1, bx1), max(my1, by1)
+        ix2, iy2 = min(mx2, bx2), min(my2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter <= 0:
+            continue                      # 完全不相干（如石柱误报 vs 车道上的动物）
+        if inter / float(bw * bh) >= cover_frac:
             return True
     return False
 
@@ -538,7 +574,7 @@ def process_file(det, local_path, remote_name, start_offset, st_time,
                     except Exception:
                         pass
 
-            # 运动兜底：夜间 ROI 内有运动且无 WANTED 命中 → unknown_animal
+            # 运动兜底：夜间 ROI 内有运动且无 WANTED 命中 → animal
             if is_night:
                 mot, mbox, marea = motion.update(frame)
                 if mot:
@@ -547,34 +583,37 @@ def process_file(det, local_path, remote_name, start_offset, st_time,
                     if in_excluded_zone((mx1 * 2, my1 * 2, mx2 * 2, my2 * 2),
                                         MOTION_EXCLUDE_ZONES):
                         mot = False
-                if mot and not dets and (t_sec - last_motion_save) >= MOTION_COOLDOWN_SEC:
+                # 互斥判定：原为 `not dets`（COCO 有任何命中就不兜底），静态误报
+                # （石柱→person）会连带堵死真实动物的兜底。改为几何覆盖判定。
+                covered = motion_covered_by_dets(mbox, dets) if mot else False
+                if mot and not covered and (t_sec - last_motion_save) >= MOTION_COOLDOWN_SEC:
                     last_motion_save = t_sec
                     motion_hits += 1
                     if dry_run:
-                        log("  [TEST] unknown_animal motion=%dpx @ %.1fs" % (marea, t_sec))
+                        log("  [TEST] animal motion=%dpx @ %.1fs" % (marea, t_sec))
                     else:
                         stamp = ev_time.strftime("%Y%m%d_%H%M%S")
                         img = annotate(frame, [])
                         bx1, by1, bx2, by2 = mbox
-                        (tw, th), _ = cv2.getTextSize("unknown_animal",
+                        (tw, th), _ = cv2.getTextSize("animal",
                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
                         cv2.rectangle(img, (bx1, by1), (bx2, by2), MOTION_COLOR, 3)
-                        label = "unknown_animal motion=%dpx" % marea
+                        label = "animal motion=%dpx" % marea
                         cv2.rectangle(img, (bx1, max(0, by1 - th - 10)),
                                       (bx1 + tw + 8, by1), MOTION_COLOR, -1)
                         cv2.putText(img, label, (bx1 + 4, by1 - 6),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20),
                                     2, cv2.LINE_AA)
-                        lj = os.path.join(WORK_DIR, "%s_unknown_animal_%d.jpg" %
+                        lj = os.path.join(WORK_DIR, "%s_animal_%d.jpg" %
                                           (stamp, marea))
                         cv2.imwrite(lj, img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                        rel = "%s/%s/%s_unknown_animal_%d.jpg" % (
+                        rel = "%s/%s/%s_animal_%d.jpg" % (
                             SNAP_REMOTE_ROOT, ev_time.strftime("%Y/%m/%d"),
                             stamp, marea)
                         if smb_put(lj, rel):
                             append_event(day_str,
                                          (ev_time.strftime("%Y-%m-%d %H:%M:%S"),
-                                          "unknown_animal", "%d" % marea,
+                                          "animal", "%d" % marea,
                                           os.path.basename(rel), remote_name,
                                           "%.1f" % t_sec))
                             log("  兜底快照: %s (运动 %dpx @ %s)" %
@@ -616,9 +655,13 @@ def main():
 
     det = Detector(MODEL_PATH)
     log("模型已加载")
-    # 浣熊模型：存在则加载（fine-tune 单类），不存在时仅用 COCO，优雅降级
+    # 浣熊模型：暂时禁用（2026-09-03，用户决策）。
+    #   背景：v2_ir 两夜实测真实捕获 0、误报 4（汽车大灯/静止物体/人头部被误判为 raccoon）。
+    #   决策：先统一用 motion 兜底 labeled "animal" 覆盖未知动物；待补负样本重训后再恢复。
+    #   恢复：将下方 RACCOON_ENABLE 改为 True，并确保 %s 存在即可自动加载。
+    RACCOON_ENABLE = False
     raccoon_det = None
-    if os.path.exists(RACCOON_MODEL):
+    if RACCOON_ENABLE and os.path.exists(RACCOON_MODEL):
         try:
             raccoon_det = Detector(
                 RACCOON_MODEL, conf_th=RACCOON_CONF_TH,
@@ -628,7 +671,7 @@ def main():
             log("浣熊模型加载失败，仅用 COCO: %s" % e)
             raccoon_det = None
     else:
-        log("未找到浣熊模型 %s，仅用 COCO（运动兜底仍覆盖未知动物）" % RACCOON_MODEL)
+        log("浣熊模型已禁用（暂时）；未知动物改由 motion 兜底 'animal' 覆盖")
 
     if mode in ("--test", "--run"):
         dry = (mode == "--test")          # --test 只报不存；--run 会真正存快照
