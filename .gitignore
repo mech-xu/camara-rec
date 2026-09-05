@@ -17,3 +17,8 @@ train_raccoon/
 
 # 本地备份
 *.bak
+*.bak.*
+# 编辑器/IDE 临时
+*.swp
+*.swo
+.DS_Store

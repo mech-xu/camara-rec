@@ -74,7 +74,9 @@ EXCLUDE_ZONES = [
 # 覆盖 COCO 漏掉的所有动物；浣熊模型暂disabled，未知动物统一走此兜底。
 # 限制：只夜间（动物活动高峰）启用 + 60s 冷却 + 每 chunk 重置 prev_gray，
 #       避免白天车辆/行人/树影误报和日→夜光照切换的误触发。
-MOTION_ROI = (0, 380, 1280, 720)     # x1,y1,x2,y2，1280 宽缩放坐标
+MOTION_ROI = (0, 200, 1280, 720)     # x1,y1,x2,y2，1280 宽缩放坐标
+# 2026-09-05 抬升：之前 y1=380 把猫/浣熊活动带（y≈260-310）整个切掉；
+# 全画面探测验证画面动态污染源（树梢/灌木）只到 y≈170，故 y1=200 安全。
 MOTION_MIN_AREA = 500                 # ROI 内运动像素 > 此值才触发
 MOTION_MIN_BBOX = 30                  # 最大轮廓 bbox 至少 30x30，过滤单点噪点
 MOTION_COOLDOWN_SEC = 60              # animal 运动兜底保存冷却
@@ -86,6 +88,22 @@ MOTION_COLOR = (60, 200, 255)         # 兜底框颜色（橙黄，与 person/ca
 MOTION_BG_ALPHA = 0.02                # 背景 EMA 学习率（越小越慢，静止物体越快并入背景）
 MOTION_DEBOUNCE_WINDOW = 4            # 去抖滑动窗口（帧）
 MOTION_DEBOUNCE_HITS = 2              # 窗口内至少命中几次才算真运动（过滤单帧灯光闪烁）
+# 照明阶跃抑制（2026-09-05 新增）：车库屋檐感应灯 + Lorex 自带 IR 灯在自动
+# 感应触发时会照亮门前区域（拖车左侧+车库前）。这种「整片区域同步变亮/暗」
+# 会被误判为大范围运动，bbox 圈出巨框（251770 px @ 23:19:26）且不触发
+# MOTION_GLOBAL_FRAC（占比仅 0.477 < 0.6）。两个独立判据互补：
+#   - 中位数阶跃：照明事件 ROI 灰度中位数前后帧跳变 ≥8
+#   - 同向性：变化像素里 >80% 同号（真实运动约 0.4-0.55）
+# 任一满足即判照明事件，强制把背景快速吸收到当前帧（fast alpha），跳过该帧
+# 不进运动判定，避免污染去抖窗口和后续帧的「背景错位」漏检。
+MOTION_LIGHT_STEP = 8.0               # 帧间 ROI 中位数变化阈值
+MOTION_LIGHT_POS_FRAC = 0.80          # 正差异占比阈值（>此为亮起，<1-此为熄灭）
+MOTION_LIGHT_AREA_MIN = 0.05          # 启用同向性判据的最小变化面积占比（太小可能是噪点）
+MOTION_BG_FAST_ALPHA = 0.35            # 照明事件时背景快速吸收的学习率
+MOTION_LIGHT_SKIP_MIN = 12             # LIGHT 触发后强制 skip 的最少帧数（生产 1fps ≈ 12s）
+MOTION_LIGHT_SKIP_RENEW = 6            # skip 期间若 area 仍大则续命的最少帧数
+MOTION_MIN_DENSITY = 0.08              # bbox 填充密度阈值：稀疏 bbox 是伪运动
+                                       # （真动物 density > 0.3，光照颗粒/IR 噪声 < 0.05）
 # 运动兜底屏蔽区（仅对 motion 兜底 animal 生效；COCO 对真实动物不受影响）
 # 反推自 WD 夜间全画面 Garage_20260902_020540.mp4（@10s, 2026-09-02 02:05:50）：
 #   L1 近壁灯: 灯泡 box ~x[180,420] y[0,230]，覆盖灯泡+顶部光晕
@@ -107,13 +125,21 @@ MOTION_COVER_FRAC = 0.30              # 检测框被运动区域覆盖的面积�
 
 
 class MotionDetector:
-    """自适应背景建模 + 时间去抖的帧差兜底。
+    """自适应背景建模 + 时间去抖 + 照明阶跃抑制的帧差兜底。
     相比朴素 absdiff(prev,cur)：
       - 维护缓慢更新的背景 EMA，静止物体（车道蓝色篷布拖车、信箱等）很快并入背景，
         不再产生帧差；夜间大门壁灯造成的缓慢亮度漂移也被背景吸收。
       - 仅在「背景之外出现持续运动」时判定 motion，配合时间去抖（debounce），
         单帧灯光闪烁 / IR illumination 抖动不会触发快照。
-    背景更新策略：当本帧运动面积低于阈值时才更新背景，避免把运动物体吸进背景。
+      - 照明阶跃抑制：车库屋檐感应灯 + Lorex IR 补光灯自动感应时，会把门前区域
+        整片照亮（同步变亮或同步变暗）。这类「同向变化」的差分会被当成巨框运动，
+        用两个独立判据捕捉后强制把背景快速吸收，避免污染后续帧。
+    背景更新策略（2026-09-05 调整）：原逻辑是「运动时不更新背景」——灯亮期间
+    持续大面积变化 → 背景卡死在「灯灭」状态 → 灯亮的每一帧都判运动（已废）。
+    现在改为「**总是用正常 alpha 更新**」，理由：慢 alpha（0.005）在持续小幅差分
+    下永远追不上，会卡死在伪运动（i=64 实测 bbox density 仅 0.02）。正常 alpha
+    能消化光照余热（EMA 系数 0.02 → 50 帧 ≈ 50 秒 1fps 追平），动物穿过几帧
+    就离开 ROI，期间 area 会快速衰减不会被吸收。
     每 chunk 由调用方 new 一个实例，避免日/夜切换污染背景。"""
     def __init__(self, alpha=MOTION_BG_ALPHA, debounce_hits=MOTION_DEBOUNCE_HITS,
                  debounce_window=MOTION_DEBOUNCE_WINDOW):
@@ -122,6 +148,8 @@ class MotionDetector:
         self.debounce_hits = debounce_hits
         self.debounce_window = debounce_window
         self._hits = []                      # 滑动窗口：最近若干帧是否触发
+        self._prev_med = None                # 上帧 ROI 灰度中位数（照明阶跃判据）
+        self._light_skip = 0                 # 照明事件后续强制快速吸收的剩余帧数
 
     def _record(self, triggered):
         self._hits.append(triggered)
@@ -136,23 +164,68 @@ class MotionDetector:
         small = cv2.resize(frame, (1280, int(h * s)))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (MOTION_BLUR_KSIZE, MOTION_BLUR_KSIZE), 0)
-        if self.bg is None:
-            self.bg = gray.astype(np.float32)
-            return False, None, 0
-        # 用 float 背景直接求差（保留 EMA 的小数部分，避免 uint8 截断破坏缓慢亮度跟踪）
-        diff = np.abs(self.bg - gray.astype(np.float32)).astype(np.uint8)
-        _, thresh = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)
-        thresh = cv2.dilate(thresh, None, iterations=2)
         rx1, ry1, rx2, ry2 = MOTION_ROI
         ry2 = min(ry2, small.shape[0])
+        gray_f = gray.astype(np.float32)
+        med_roi = float(np.median(gray[ry1:ry2, rx1:rx2]))
+        if self.bg is None:
+            self.bg = gray_f.copy()
+            self._prev_med = med_roi
+            return False, None, 0
+        diff = np.abs(self.bg - gray_f).astype(np.uint8)
+        _, thresh = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)
+        thresh = cv2.dilate(thresh, None, iterations=2)
         roi = thresh[ry1:ry2, rx1:rx2]
         area = int((roi > 0).sum())
         roi_total = max(1, (rx2 - rx1) * (ry2 - ry1))
-        # 全局亮度变化（壁灯开关 / IR illumination 漂移 / 车灯扫过）会让整个 ROI
-        # 同步变化，占比极高，并非局部运动；此时直接吸收进背景、不触发兜底。
-        is_global = (area / roi_total) > MOTION_GLOBAL_FRAC
-        if area < MOTION_MIN_AREA or is_global:
-            self.bg = (1.0 - self.alpha) * self.bg + self.alpha * gray.astype(np.float32)
+        frac = area / roi_total
+        # 全局亮度变化判据（兜底，防止单判据漏检）
+        is_global = frac > MOTION_GLOBAL_FRAC
+
+        # 照明阶跃判据 1：ROI 灰度中位数前后帧跳变
+        dmed = med_roi - (self._prev_med if self._prev_med is not None else med_roi)
+        light_step_hit = abs(dmed) >= MOTION_LIGHT_STEP
+
+        # 照明阶跃判据 2：变化像素同向性（正差异占比极高=全亮起；极低=全暗）
+        signed_roi = (gray_f - self.bg)[ry1:ry2, rx1:rx2]
+        pos_sum = float(np.clip(signed_roi, 0, None).sum())
+        neg_sum = float(np.clip(-signed_roi, 0, None).sum())
+        pos_frac = pos_sum / (pos_sum + neg_sum + 1e-6)
+        light_directional_hit = (frac >= MOTION_LIGHT_AREA_MIN and
+                                  (pos_frac >= MOTION_LIGHT_POS_FRAC or
+                                   pos_frac <= (1.0 - MOTION_LIGHT_POS_FRAC)))
+
+        is_light = light_step_hit or light_directional_hit
+
+        # 照明事件或其后余热：强制用快 alpha 把背景拉向当前帧，避免污染后续帧；
+        # 标记为「无运动」并清空去抖窗口（防「1帧灯+1帧真运动」拼成 2/4 假阳性）。
+        # _light_skip 起跳设到 MOTION_LIGHT_SKIP_MIN（生产 1fps ≈ 12s），确保 LIGHT
+        # 后期未触发的「半更新态」（背景错位→颗粒噪声）也在保护期内被快吸收。
+        if is_light:
+            self.bg = ((1.0 - MOTION_BG_FAST_ALPHA) * self.bg
+                       + MOTION_BG_FAST_ALPHA * gray_f)
+            self._light_skip = max(self._light_skip, MOTION_LIGHT_SKIP_MIN)
+            self._hits.clear()
+            self._prev_med = med_roi
+            return False, None, area
+
+        if self._light_skip > 0:
+            self.bg = ((1.0 - MOTION_BG_FAST_ALPHA) * self.bg
+                       + MOTION_BG_FAST_ALPHA * gray_f)
+            # skip 期间若差分仍大（半更新态/光照余热），续命防止提前退出误报
+            if area >= MOTION_MIN_AREA:
+                self._light_skip = max(self._light_skip, MOTION_LIGHT_SKIP_RENEW)
+            self._light_skip -= 1
+            self._prev_med = med_roi
+            return False, None, area
+
+        # 背景更新：总是用正常 alpha（见类 docstring 解释慢 alpha 已废）
+        self.bg = (1.0 - self.alpha) * self.bg + self.alpha * gray_f
+        self._prev_med = med_roi
+
+        if is_global:
+            return self._record(False), None, area
+        if area < MOTION_MIN_AREA:
             return self._record(False), None, area
         contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
@@ -161,6 +234,11 @@ class MotionDetector:
         largest = max(contours, key=cv2.contourArea)
         bx, by, bw, bh = cv2.boundingRect(largest)
         if bw < MOTION_MIN_BBOX or bh < MOTION_MIN_BBOX:
+            return self._record(False), None, area
+        # bbox 密度过滤：真动物 bbox 致密（density > 0.3），照明颗粒/IR 噪声稀疏
+        # （density < 0.05，i=64 实测 0.02）。稀疏 bbox 直接丢弃，不进去抖窗口。
+        bb_area = max(1, bw * bh)
+        if (area / bb_area) < MOTION_MIN_DENSITY:
             return self._record(False), None, area
         # 时间去抖：本帧有运动，需滑动窗口内累计命中达标才判定为真运动
         if sum(self._hits) + 1 < self.debounce_hits:
