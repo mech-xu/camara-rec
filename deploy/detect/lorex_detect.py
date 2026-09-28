@@ -55,6 +55,9 @@ NMS_TH = 0.50
 COOLDOWN_SEC = 45       # 同一类别在此秒数内最多存 1 张
 POLL_SEC = 180          # 守护模式轮询间隔
 MAX_CHUNK_SEC = 1200    # 单次最多追多少秒
+SEG_DURATION = 1800.0   # 录像切片固定时长（lorex_record.sh 的 -segment_time 1800）
+SEG_DONE_TOL = 2.0      # 判定「片段已跑完」的容差（秒）
+SEG_LOOKBACK = 3        # 每轮最多回看几个片段（补齐旧片段尾部，防止 state 无限增长）
 
 # 静态热区抑制：固定摄像头下，某些固定物体（石柱、灌木丛、信箱杆等）会被
 # YOLOv8n 反复误标为 person。坐标是「原始帧坐标」(2560x1440)；只对 person 生效，
@@ -706,8 +709,16 @@ def process_file(det, local_path, remote_name, start_offset, st_time,
         n_frames += got
         if got == 0:
             break
-        cur_off += chunk
-        remaining -= chunk
+        # ⚠️ 关键修复（2026-09-28，浣熊漏报根因）：
+        # 必须按「实际解码到的帧数」推进 offset，不能按名义 chunk 长度推进。
+        # 守护模式处理的是**仍在写入中**的片段，fetch 拿到的文件是截断的，
+        # ffmpeg 能读到的帧数 < chunk。旧代码无条件 `cur_off += chunk`，等于把
+        # 该 chunk 的尾部永久标记成「已处理」——实测 1500s 起的块只读到 110 帧
+        #（当时文件 211.3MB / 完整 236.4MB ≈ 1609s），于是 1610–1800s 整段
+        #（含 02:24:53 的浣熊、02:23:08 的另一只）从未被分析，直接漏报。
+        advanced = min(got / SAMPLE_FPS, chunk)
+        cur_off += advanced
+        remaining -= advanced
         if state is not None:
             state[remote_name] = cur_off
             save_state(state)
@@ -795,25 +806,42 @@ def main():
             if not segs:
                 log("未找到录像")
             else:
-                remote = segs[-1]
-                name = os.path.basename(remote)
-                if state.get("__last") != name:
-                    log("新片段: %s" % name)
-                    state["__last"] = name
-                    state.pop(name, None)
+                newest = os.path.basename(segs[-1])
+                if state.get("__last") != newest:
+                    log("新片段: %s" % newest)
+                    state["__last"] = newest
                     save_state(state)
-                off = state.get(name, 0.0)
-                local = os.path.join(WORK_DIR, "cur.mp4")
-                os.makedirs(WORK_DIR, exist_ok=True)
-                t = time.time()
-                if fetch(remote, local):
+                # ⚠️ 关键修复（2026-09-28）：不再「只处理最新片段 + 切换时丢弃旧进度」。
+                # 旧逻辑在片段还没写完时就处理了它的一部分，等新片段出现时
+                # `state.pop(name)` 会把还没跑的尾巴永久丢掉（与 process_file 的
+                # offset 跳跃是同一根因的两个表现）。现在改为每轮把最近 SEG_LOOKBACK 个
+                # 「尚未跑完」的片段按由旧到新补齐，彻底消除盲区。
+                todo = [s for s in segs[-SEG_LOOKBACK:]
+                        if state.get(os.path.basename(s), 0.0)
+                        < SEG_DURATION - SEG_DONE_TOL]
+                for remote in todo:
+                    name = os.path.basename(remote)
+                    local = os.path.join(WORK_DIR, "cur.mp4")
+                    os.makedirs(WORK_DIR, exist_ok=True)
+                    off = state.get(name, 0.0)
+                    t = time.time()
+                    if not fetch(remote, local):
+                        log("拉取失败: %s" % name)
+                        continue
                     log("拉取 %s (%.1fMB/%.1fs) 从 %.1fs 开始处理"
-                        % (name, os.path.getsize(local) / 1e6, time.time() - t, off))
+                        % (name, os.path.getsize(local) / 1e6,
+                           time.time() - t, off))
                     process_file(det, local, name, off,
                                  seg_start_time(remote), state,
                                  raccoon_det=raccoon_det)
-                else:
-                    log("拉取失败: %s" % name)
+                    # 片段已写完（非最新）且推进到尾部 → 回收，避免每轮重复拉 236MB。
+                    # 「本轮毫无推进」同样视为读完（文件到此为止），否则偏短的片段
+                    # 永远达不到 SEG_DURATION 门槛，会每轮卡住反复拉取。
+                    if name != newest and (state.get(name, 0.0)
+                                           >= SEG_DURATION - SEG_DONE_TOL
+                                           or state.get(name, 0.0) <= off):
+                        state.pop(name, None)
+                        save_state(state)
         except Exception as e:
             log("循环异常: %s" % e)
         for _ in range(POLL_SEC):
